@@ -2,7 +2,7 @@
 # pylint: disable=protected-access
 import asyncio
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, sentinel
 from datetime import datetime, timedelta
 
 import pytz
@@ -15,9 +15,10 @@ import homeassistant.util.dt as dt_util
 from homeassistant.util.unit_system import (METRIC_SYSTEM)
 from homeassistant.const import (
     __version__, EVENT_STATE_CHANGED, ATTR_FRIENDLY_NAME, CONF_UNIT_SYSTEM,
-    SERVICE_HOMEASSISTANT_RESTART, RESTART_EXIT_CODE)
+    ATTR_NOW, EVENT_TIME_CHANGED, EVENT_HOMEASSISTANT_STOP,
+    EVENT_HOMEASSISTANT_CLOSE, EVENT_HOMEASSISTANT_START)
 
-from tests.common import get_test_home_assistant, mock_generator
+from tests.common import get_test_home_assistant
 
 PST = pytz.timezone('America/Los_Angeles')
 
@@ -88,6 +89,26 @@ def test_async_run_job_delegates_non_async():
     assert len(hass.async_add_job.mock_calls) == 1
 
 
+def test_stage_shutdown():
+    """Simulate a shutdown, test calling stuff."""
+    hass = get_test_home_assistant()
+    test_stop = []
+    test_close = []
+    test_all = []
+
+    hass.bus.listen(
+        EVENT_HOMEASSISTANT_STOP, lambda event: test_stop.append(event))
+    hass.bus.listen(
+        EVENT_HOMEASSISTANT_CLOSE, lambda event: test_close.append(event))
+    hass.bus.listen('*', lambda event: test_all.append(event))
+
+    hass.stop()
+
+    assert len(test_stop) == 1
+    assert len(test_close) == 1
+    assert len(test_all) == 1
+
+
 class TestHomeAssistant(unittest.TestCase):
     """Test the Home Assistant core classes."""
 
@@ -100,26 +121,6 @@ class TestHomeAssistant(unittest.TestCase):
     def tearDown(self):
         """Stop everything that was started."""
         self.hass.stop()
-
-    # This test hangs on `loop.add_signal_handler`
-    # def test_start_and_sigterm(self):
-    #     """Start the test."""
-    #     calls = []
-    #     self.hass.bus.listen_once(EVENT_HOMEASSISTANT_START,
-    #                               lambda event: calls.append(1))
-
-    #     self.hass.start()
-
-    #     self.assertEqual(1, len(calls))
-
-    #     self.hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP,
-    #                               lambda event: calls.append(1))
-
-    #     os.kill(os.getpid(), signal.SIGTERM)
-
-    #     self.hass.block_till_done()
-
-    #     self.assertEqual(1, len(calls))
 
     def test_pending_sheduler(self):
         """Add a coro to pending tasks."""
@@ -220,39 +221,6 @@ class TestHomeAssistant(unittest.TestCase):
         """Try to add a job with None as function."""
         with pytest.raises(ValueError):
             self.hass.add_job(None, 'test_arg')
-
-    @patch('asyncio.create_subprocess_exec')
-    def test_restart(self, mock_create):
-        """Check that restart propagates to stop."""
-        process_mock = MagicMock()
-        attrs = {
-            'communicate.return_value': mock_generator(('output', 'error')),
-            'wait.return_value': mock_generator(0)}
-        process_mock.configure_mock(**attrs)
-        mock_create.return_value = mock_generator(process_mock)
-
-        self.hass.start()
-        with patch.object(self.hass, 'async_stop') as mock_stop:
-            self.hass.services.call(ha.DOMAIN, SERVICE_HOMEASSISTANT_RESTART)
-            mock_stop.assert_called_once_with()
-        self.assertEqual(RESTART_EXIT_CODE, self.hass.exit_code)
-
-    @patch('asyncio.create_subprocess_exec')
-    def test_restart_bad_config(self, mock_create):
-        """Check that restart with a bad config doesn't propagate to stop."""
-        process_mock = MagicMock()
-        attrs = {
-            'communicate.return_value':
-                mock_generator((r'\033[hellom'.encode('utf-8'), 'error')),
-            'wait.return_value': mock_generator(1)}
-        process_mock.configure_mock(**attrs)
-        mock_create.return_value = mock_generator(process_mock)
-
-        self.hass.start()
-        with patch.object(self.hass, 'async_stop') as mock_stop:
-            self.hass.services.call(ha.DOMAIN, SERVICE_HOMEASSISTANT_RESTART)
-            mock_stop.assert_not_called()
-        self.assertEqual(None, self.hass.exit_code)
 
 
 class TestEvent(unittest.TestCase):
@@ -762,7 +730,7 @@ class TestConfig(unittest.TestCase):
             CONF_UNIT_SYSTEM: METRIC_SYSTEM.as_dict(),
             'location_name': None,
             'time_zone': 'UTC',
-            'components': [],
+            'components': set(),
             'config_dir': '/tmp/ha-config',
             'version': __version__,
         }
@@ -770,37 +738,78 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(expected, self.config.as_dict())
 
 
-class TestAsyncCreateTimer(object):
+@patch('homeassistant.core.monotonic')
+def test_create_timer(mock_monotonic, loop):
     """Test create timer."""
+    hass = MagicMock()
+    funcs = []
+    orig_callback = ha.callback
 
-    @patch('homeassistant.core.asyncio.Event')
-    @patch('homeassistant.core.dt_util.utcnow')
-    def test_create_timer(self, mock_utcnow, mock_event, event_loop):
-        """Test create timer fires correctly."""
-        hass = MagicMock()
-        now = mock_utcnow()
-        event = mock_event()
-        now.second = 1
-        mock_utcnow.reset_mock()
+    def mock_callback(func):
+        funcs.append(func)
+        return orig_callback(func)
 
+    with patch.object(ha, 'callback', mock_callback):
         ha._async_create_timer(hass)
-        assert len(hass.bus.async_listen_once.mock_calls) == 2
-        start_timer = hass.bus.async_listen_once.mock_calls[1][1][1]
 
-        event_loop.run_until_complete(start_timer(None))
-        assert hass.loop.create_task.called
+        assert len(funcs) == 3
+        fire_time_event, start_timer, stop_timer = funcs
 
-        timer = hass.loop.create_task.mock_calls[0][1][0]
-        event.is_set.side_effect = False, False, True
-        event_loop.run_until_complete(timer)
-        assert len(mock_utcnow.mock_calls) == 1
+    assert len(hass.bus.async_listen_once.mock_calls) == 1
+    event_type, callback = hass.bus.async_listen_once.mock_calls[0][1]
+    assert event_type == EVENT_HOMEASSISTANT_START
+    assert callback is start_timer
 
-        assert hass.loop.call_soon.called
-        event_type, event_data = hass.loop.call_soon.mock_calls[0][1][1:]
+    mock_monotonic.side_effect = 10.2, 10.3
 
-        assert ha.EVENT_TIME_CHANGED == event_type
-        assert {ha.ATTR_NOW: now} == event_data
+    with patch('homeassistant.core.dt_util.utcnow',
+               return_value=sentinel.mock_date):
+        start_timer(None)
 
-        stop_timer = hass.bus.async_listen_once.mock_calls[0][1][1]
-        stop_timer(None)
-        assert event.set.called
+    assert len(hass.bus.async_listen_once.mock_calls) == 2
+    assert len(hass.bus.async_fire.mock_calls) == 1
+    assert len(hass.loop.call_later.mock_calls) == 1
+
+    event_type, callback = hass.bus.async_listen_once.mock_calls[1][1]
+    assert event_type == EVENT_HOMEASSISTANT_STOP
+    assert callback is stop_timer
+
+    slp_seconds, callback, nxt = hass.loop.call_later.mock_calls[0][1]
+    assert abs(slp_seconds - 0.9) < 0.001
+    assert callback is fire_time_event
+    assert abs(nxt - 11.2) < 0.001
+
+    event_type, event_data = hass.bus.async_fire.mock_calls[0][1]
+    assert event_type == EVENT_TIME_CHANGED
+    assert event_data[ATTR_NOW] is sentinel.mock_date
+
+
+@patch('homeassistant.core.monotonic')
+def test_timer_out_of_sync(mock_monotonic, loop):
+    """Test create timer."""
+    hass = MagicMock()
+    funcs = []
+    orig_callback = ha.callback
+
+    def mock_callback(func):
+        funcs.append(func)
+        return orig_callback(func)
+
+    with patch.object(ha, 'callback', mock_callback):
+        ha._async_create_timer(hass)
+
+        assert len(funcs) == 3
+        fire_time_event, start_timer, stop_timer = funcs
+
+    mock_monotonic.side_effect = 10.2, 11.3, 11.3
+
+    with patch('homeassistant.core.dt_util.utcnow',
+               return_value=sentinel.mock_date):
+        start_timer(None)
+
+    assert len(hass.loop.call_later.mock_calls) == 1
+
+    slp_seconds, callback, nxt = hass.loop.call_later.mock_calls[0][1]
+    assert slp_seconds == 1
+    assert callback is fire_time_event
+    assert abs(nxt - 12.3) < 0.001

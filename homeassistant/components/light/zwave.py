@@ -13,11 +13,11 @@ from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_COLOR_TEMP, \
     ATTR_RGB_COLOR, SUPPORT_BRIGHTNESS, SUPPORT_COLOR_TEMP, \
     SUPPORT_RGB_COLOR, DOMAIN, Light
 from homeassistant.components import zwave
+from homeassistant.components.zwave import async_setup_platform  # noqa # pylint: disable=unused-import
 from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.util.color import HASS_COLOR_MAX, HASS_COLOR_MIN, \
     color_temperature_mired_to_kelvin, color_temperature_to_rgb, \
     color_rgb_to_rgbw, color_rgbw_to_rgb
-from homeassistant.helpers import customize
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,32 +49,19 @@ SUPPORT_ZWAVE_COLORTEMP = (SUPPORT_BRIGHTNESS | SUPPORT_RGB_COLOR
                            | SUPPORT_COLOR_TEMP)
 
 
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    """Find and add Z-Wave lights."""
-    if discovery_info is None or zwave.NETWORK is None:
-        return
-    node = zwave.NETWORK.nodes[discovery_info[zwave.const.ATTR_NODE_ID]]
-    value = node.values[discovery_info[zwave.const.ATTR_VALUE_ID]]
+def get_device(node, value, node_config, **kwargs):
+    """Create zwave entity device."""
     name = '{}.{}'.format(DOMAIN, zwave.object_id(value))
-    node_config = customize.get_overrides(hass, zwave.DOMAIN, name)
     refresh = node_config.get(zwave.CONF_REFRESH_VALUE)
     delay = node_config.get(zwave.CONF_REFRESH_DELAY)
     _LOGGER.debug('name=%s node_config=%s CONF_REFRESH_VALUE=%s'
                   ' CONF_REFRESH_DELAY=%s', name, node_config,
                   refresh, delay)
-    if value.command_class != zwave.const.COMMAND_CLASS_SWITCH_MULTILEVEL:
-        return
-    if value.type != zwave.const.TYPE_BYTE:
-        return
-    if value.genre != zwave.const.GENRE_USER:
-        return
-
-    value.set_change_verified(False)
 
     if node.has_command_class(zwave.const.COMMAND_CLASS_SWITCH_COLOR):
-        add_devices([ZwaveColorLight(value, refresh, delay)])
+        return ZwaveColorLight(value, refresh, delay)
     else:
-        add_devices([ZwaveDimmer(value, refresh, delay)])
+        return ZwaveDimmer(value, refresh, delay)
 
 
 def brightness_state(value):
@@ -108,13 +95,12 @@ class ZwaveDimmer(zwave.ZWaveDeviceEntity, Light):
                     _LOGGER.debug("AEOTEC ZW098 workaround enabled")
                     self._zw098 = 1
 
-        self.update_properties()
-
         # Used for value change event handling
         self._refreshing = False
         self._timer = None
         _LOGGER.debug('self._refreshing=%s self.delay=%s',
                       self._refresh_value, self._delay)
+        self.update_properties()
 
     def update_properties(self):
         """Update internal properties based on zwave values."""
@@ -126,7 +112,6 @@ class ZwaveDimmer(zwave.ZWaveDeviceEntity, Light):
         if self._refresh_value:
             if self._refreshing:
                 self._refreshing = False
-                self.update_properties()
             else:
                 def _refresh_value():
                     """Used timer callback for delayed value refresh."""
@@ -138,10 +123,8 @@ class ZwaveDimmer(zwave.ZWaveDeviceEntity, Light):
 
                 self._timer = Timer(self._delay, _refresh_value)
                 self._timer.start()
-            self.schedule_update_ha_state()
-        else:
-            self.update_properties()
-            self.schedule_update_ha_state()
+                return
+        super().value_changed(value)
 
     @property
     def brightness(self):
@@ -217,11 +200,9 @@ class ZwaveColorLight(ZwaveDimmer):
                 self._value_color = value_color
 
         if self._value_color_channels is None:
-            for value_color_channels in self._value.node.get_values(
-                    class_id=zwave.const.COMMAND_CLASS_SWITCH_COLOR,
-                    genre=zwave.const.GENRE_SYSTEM,
-                    type=zwave.const.TYPE_INT).values():
-                self._value_color_channels = value_color_channels
+            self._value_color_channels = self.get_value(
+                class_id=zwave.const.COMMAND_CLASS_SWITCH_COLOR,
+                genre=zwave.const.GENRE_SYSTEM, type=zwave.const.TYPE_INT)
 
         if self._value_color and self._value_color_channels:
             _LOGGER.debug("Zwave node color values found.")

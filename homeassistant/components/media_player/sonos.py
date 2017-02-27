@@ -365,7 +365,6 @@ class SonosDevice(MediaPlayerDevice):
             self._support_pause = False
             self._is_playing_tv = False
             self._is_playing_line_in = False
-            self._favorite_sources = None
             self._source_name = None
             self._last_avtransport_event = None
             return
@@ -761,10 +760,10 @@ class SonosDevice(MediaPlayerDevice):
             return self._media_title
 
     @property
-    def supported_media_commands(self):
-        """Flag of media commands that are supported."""
+    def supported_features(self):
+        """Flag media player features that are supported."""
         if self._coordinator:
-            return self._coordinator.supported_media_commands
+            return self._coordinator.supported_features
 
         supported = SUPPORT_SONOS
 
